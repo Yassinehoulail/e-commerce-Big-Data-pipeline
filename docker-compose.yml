@@ -1,0 +1,300 @@
+version: '3.8'
+
+services:
+  # Service Zookeeper (required by Kafka)
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: ecommerce_zookeeper
+    restart: always
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - ecommerce_network
+
+  # Service Kafka
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: ecommerce_kafka
+    restart: always
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://ecommerce_kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - ecommerce_network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # Kafka UI for topic monitoring
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: ecommerce_kafka_ui
+    restart: always
+    depends_on:
+      - kafka
+    ports:
+      - "8081:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: ecommerce-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: ecommerce_kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - ecommerce_network
+
+  # Kafka Topic Initialization
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: ecommerce_kafka_init
+    depends_on:
+      - kafka
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Waiting for Kafka to be ready..."
+        cub kafka-ready -b kafka:9092 1 30
+        echo "Creating Kafka topics..."
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --partitions 3 --replication-factor 1 --topic books-raw
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --partitions 3 --replication-factor 1 --topic books-silver
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --partitions 3 --replication-factor 1 --topic books-gold
+        echo "Topics created successfully!"
+        kafka-topics --list --bootstrap-server kafka:9092
+    environment:
+      KAFKA_BROKER_ID: 1
+    networks:
+      - ecommerce_network
+
+  # Service MySQL
+  mysql:
+    image: mysql:8.0
+    container_name: ecommerce_mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: ecommerce_db
+      MYSQL_USER: ecommerce_user
+      MYSQL_PASSWORD: ecommerce_password
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - ecommerce_network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      timeout: 20s
+      retries: 10
+
+  # Service phpMyAdmin
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin:latest
+    container_name: ecommerce_phpmyadmin
+    restart: always
+    environment:
+      PMA_HOST: mysql
+      PMA_PORT: 3306
+      PMA_USER: root
+      PMA_PASSWORD: rootpassword
+      UPLOAD_LIMIT: 100M
+    ports:
+      - "8080:80"
+    depends_on:
+      - mysql
+    networks:
+      - ecommerce_network
+
+  # Service MinIO
+  minio:
+    image: minio/minio:latest
+    container_name: ecommerce_minio
+    restart: always
+    command: server /data --console-address ":9001" --address ":9000"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - ecommerce_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # MinIO Client Init - Create buckets
+  minio-init:
+    image: minio/mc:latest
+    container_name: ecommerce_minio_init
+    depends_on:
+      - minio
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Waiting for MinIO to be ready..."
+        sleep 10
+        echo "Configuring MinIO client..."
+        mc alias set myminio http://minio:9000 minioadmin minioadmin
+        echo "Creating buckets..."
+        mc mb myminio/bronze --ignore-existing
+        mc mb myminio/silver --ignore-existing
+        mc mb myminio/gold --ignore-existing
+        echo "Buckets created successfully!"
+        mc ls myminio
+    networks:
+      - ecommerce_network
+
+  # PostgreSQL for Airflow metadata
+  postgres:
+    image: postgres:13
+    container_name: ecommerce_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - ecommerce_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Airflow initialization
+  airflow-init:
+    image: apache/airflow:2.7.3-python3.9
+    container_name: ecommerce_airflow_init
+    depends_on:
+      - postgres
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        airflow db init &&
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com \
+          --password admin
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+      AIRFLOW__WEBSERVER__SECRET_KEY: 'temporary_secret_key_change_in_production'
+      AIRFLOW__WEBSERVER__BASE_URL: http://localhost:8082
+    networks:
+      - ecommerce_network
+
+  # Airflow Webserver
+  airflow-webserver:
+    image: apache/airflow:2.7.3-python3.9
+    container_name: ecommerce_airflow_webserver
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./scraper:/opt/airflow/scraper
+      - ./transform:/opt/airflow/transform
+      - ./minio_scripts:/opt/airflow/minio_scripts
+      - ./kafka:/opt/airflow/kafka
+      - ./data:/opt/airflow/data
+      - ./load_to_mysql.py:/opt/airflow/load_to_mysql.py
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+      AIRFLOW__WEBSERVER__SECRET_KEY: 'temporary_secret_key_change_in_production'
+      AIRFLOW__WEBSERVER__BASE_URL: http://localhost:8082
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      MINIO_ENDPOINT: 172.19.0.10:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_SECURE: 'false'
+    command: webserver
+    networks:
+      - ecommerce_network
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Airflow Scheduler
+  airflow-scheduler:
+    image: apache/airflow:2.7.3-python3.9
+    container_name: ecommerce_airflow_scheduler
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-webserver:
+        condition: service_started
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./scraper:/opt/airflow/scraper
+      - ./transform:/opt/airflow/transform
+      - ./minio_scripts:/opt/airflow/minio_scripts
+      - ./kafka:/opt/airflow/kafka
+      - ./data:/opt/airflow/data
+      - ./load_to_mysql.py:/opt/airflow/load_to_mysql.py
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+      AIRFLOW__WEBSERVER__SECRET_KEY: 'temporary_secret_key_change_in_production'
+      AIRFLOW__WEBSERVER__BASE_URL: http://localhost:8082
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      MINIO_ENDPOINT: 172.19.0.10:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_SECURE: 'false'
+    command: scheduler
+    networks:
+      - ecommerce_network
+
+volumes:
+  mysql_data:
+    driver: local
+  minio_data:
+    driver: local
+  postgres_data:
+    driver: local
+
+networks:
+  ecommerce_network:
+    driver: bridge

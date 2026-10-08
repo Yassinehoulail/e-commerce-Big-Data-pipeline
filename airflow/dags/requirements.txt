@@ -1,0 +1,9 @@
+minio
+pandas
+numpy
+confluent-kafka
+pymysql
+requests
+beautifulsoup4
+kafka-python
+mysql-connector-python
